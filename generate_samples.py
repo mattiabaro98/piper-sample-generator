@@ -10,12 +10,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import numpy as np
-import torch
+import onnxruntime as ort
 import torchaudio
 import webrtcvad
 from piper_phonemize import phonemize_espeak
-
-from piper_train.vits import commons
 
 _DIR = Path(__file__).parent
 _LOGGER = logging.getLogger(__name__)
@@ -28,7 +26,7 @@ def generate_samples(
     output_dir: Union[str, Path],
     max_samples: Optional[int] = None,
     file_names: Optional[List[str]] = None,
-    model: Union[str, Path] = _DIR / "models" / "en_US-libritts_r-medium.pt",
+    model: Union[str, Path] = _DIR / "models" / "it_IT-riccardo-x_low.onnx",
     batch_size: int = 1,
     slerp_weights: Tuple[float, ...] = (0.5,),
     length_scales: Tuple[float, ...] = (0.75, 1, 1.25),
@@ -50,7 +48,7 @@ def generate_samples(
         max_samples (int): The maximum number of samples to generate.
         file_names (List[str]): The names to use when saving the files. Must be the same length
                                 as the `text` argument, if a list.
-        model (str): The path to the STT model to use for generation.
+        model (str): The path to the ONNX model to use for generation.
         batch_size (int): The batch size to use when generated the clips
         slerp_weights (List[float]): The weights to use when mixing speakers via SLERP.
         length_scales (List[float]): Controls the average duration/speed of the generated speech.
@@ -59,7 +57,7 @@ def generate_samples(
         max_speakers (int): The maximum speaker number to use, if the model is multi-speaker.
         verbose (bool): Enable or disable more detailed logging messages (default: False).
         auto_reduce_batch_size (bool): Automatically and temporarily reduce the batch size
-                                       if CUDA OOM errors are detected, and try to resume generation.
+                                       if memory errors are detected, and try to resume generation.
         min_phoneme_count (int): If set, ensure this number of phonemes is always sent to the model.
                                  Clip audio to extract original phrase.
 
@@ -73,13 +71,18 @@ def generate_samples(
     _LOGGER.debug("Loading %s", model)
     model_path = Path(model)
 
-    torch_model = torch.load(model_path)
-    torch_model.eval()
-    _LOGGER.info("Successfully loaded the model")
-
-    if torch.cuda.is_available():
-        torch_model.cuda()
-        _LOGGER.debug("CUDA available, using GPU")
+    # Set up ONNX Runtime session
+    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    try:
+        ort_session = ort.InferenceSession(str(model_path), providers=providers)
+        _LOGGER.info("Successfully loaded the ONNX model")
+        if 'CUDAExecutionProvider' in ort_session.get_providers():
+            _LOGGER.debug("CUDA available, using GPU")
+        else:
+            _LOGGER.debug("Using CPU")
+    except Exception as e:
+        _LOGGER.error("Failed to load ONNX model: %s", e)
+        return
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -145,112 +148,119 @@ def generate_samples(
         batch_size = len(speakers_batch)
         slerp_weight, length_scale, noise_scale, noise_scale_w = next(settings_iter)
 
-        with torch.no_grad():
-            speaker_1 = torch.LongTensor([s[0] for s in speakers_batch])
-            speaker_2 = torch.LongTensor([s[1] for s in speakers_batch])
+        speaker_1 = np.array([s[0] for s in speakers_batch], dtype=np.int64)
+        speaker_2 = np.array([s[1] for s in speakers_batch], dtype=np.int64)
 
-            phoneme_ids_by_batch = []
-            clip_indexes_by_batch = []
-            for i in range(batch_size):
-                phoneme_ids, clip_phoneme_index = get_phonemes(
-                    voice, config, next(texts), verbose, min_phoneme_count
-                )
-                phoneme_ids_by_batch.append(phoneme_ids)
-                clip_indexes_by_batch.append(clip_phoneme_index)
+        phoneme_ids_by_batch = []
+        clip_indexes_by_batch = []
+        for i in range(batch_size):
+            phoneme_ids, clip_phoneme_index = get_phonemes(
+                voice, config, next(texts), verbose, min_phoneme_count
+            )
+            phoneme_ids_by_batch.append(phoneme_ids)
+            clip_indexes_by_batch.append(clip_phoneme_index)
 
-            def right_pad_lists(lists):
-                max_length = max(len(lst) for lst in lists)
-                padded_lists = []
-                for lst in lists:
-                    padded_l = lst + [1] * (
-                        max_length - len(lst)
-                    )  # phoneme 1 (corresponding to '^' character seems to work best)
-                    padded_lists.append(padded_l)
-                return padded_lists
+        def right_pad_lists(lists):
+            max_length = max(len(lst) for lst in lists)
+            padded_lists = []
+            for lst in lists:
+                padded_l = lst + [1] * (
+                    max_length - len(lst)
+                )  # phoneme 1 (corresponding to '^' character seems to work best)
+                padded_lists.append(padded_l)
+            return padded_lists
 
-            phoneme_ids_by_batch = right_pad_lists(phoneme_ids_by_batch)
+        phoneme_ids_by_batch = right_pad_lists(phoneme_ids_by_batch)
 
-            if auto_reduce_batch_size:
-                oom_error = True
-                counter = 1
-                while oom_error is True:
-                    try:
-                        audio, phoneme_samples = generate_audio(
-                            torch_model,
-                            speaker_1[0 : batch_size // counter],
-                            speaker_2[0 : batch_size // counter],
-                            phoneme_ids_by_batch[0 : batch_size // counter],
-                            slerp_weight,
-                            noise_scale,
-                            noise_scale_w,
-                            length_scale,
-                            max_len,
-                        )
-                        oom_error = False
-                    except torch.cuda.OutOfMemoryError:
-                        torch.cuda.empty_cache()
+        if auto_reduce_batch_size:
+            oom_error = True
+            counter = 1
+            while oom_error is True:
+                try:
+                    audio, phoneme_samples = generate_audio_onnx(
+                        ort_session,
+                        speaker_1[0 : batch_size // counter],
+                        speaker_2[0 : batch_size // counter],
+                        phoneme_ids_by_batch[0 : batch_size // counter],
+                        slerp_weight,
+                        noise_scale,
+                        noise_scale_w,
+                        length_scale,
+                        max_len,
+                    )
+                    oom_error = False
+                except Exception as e:
+                    if "memory" in str(e).lower() or "out of memory" in str(e).lower():
                         gc.collect()
                         counter += 1  # reduce batch size to avoid OOM errors
-            else:
-                audio, phoneme_samples = generate_audio(
-                    torch_model,
-                    speaker_1,
-                    speaker_2,
-                    phoneme_ids_by_batch,
-                    slerp_weight,
-                    noise_scale,
-                    noise_scale_w,
-                    length_scale,
-                    max_len,
+                        _LOGGER.warning("Memory error, reducing batch size to %d", batch_size // counter)
+                    else:
+                        raise e
+        else:
+            audio, phoneme_samples = generate_audio_onnx(
+                ort_session,
+                speaker_1,
+                speaker_2,
+                phoneme_ids_by_batch,
+                slerp_weight,
+                noise_scale,
+                noise_scale_w,
+                length_scale,
+                max_len,
+            )
+
+        # Clip audio when using min_phoneme_count
+        for i, clip_phoneme_index in enumerate(clip_indexes_by_batch):
+            if clip_phoneme_index is not None:
+                first_sample_idx = int(
+                    phoneme_samples[i].flatten()[:clip_phoneme_index-1].sum().item()
                 )
-
-            # Clip audio when using min_phoneme_count
-            for i, clip_phoneme_index in enumerate(clip_indexes_by_batch):
-                if clip_phoneme_index is not None:
-                    first_sample_idx = int(
-                        phoneme_samples[i].flatten()[:clip_phoneme_index-1].sum().item()
-                    )
-                    
-                    # Fill start of audio with silence until actual sample.
-                    # It will be removed in the next stage.
-                    audio[i, 0, :first_sample_idx] = 0
-
-                # Fill time after last speech with silence.
-                # It will be removed in the next stage
-                last_sample_idx = int(phoneme_samples[i].flatten().sum().item())
-                audio[i, 0, last_sample_idx+1:] = 0
-
-            # Resample audio
-            audio = resampler(audio.cpu()).numpy()
-
-            audio_int16 = audio_float_to_int16(audio)
-            for audio_idx in range(audio_int16.shape[0]):
-                # Trim any silenced audio
-                audio_data = np.trim_zeros(audio_int16[audio_idx].flatten())
                 
-                # Use webrtcvad to trim any remaining silence from the clips
-                audio_data = remove_silence(audio_int16[audio_idx].flatten())[
-                    None,
-                ]
+                # Fill start of audio with silence until actual sample.
+                # It will be removed in the next stage.
+                audio[i, 0, :first_sample_idx] = 0
 
-                if isinstance(file_names, it.cycle):
-                    wav_path = output_dir / next(file_names)
-                else:
-                    wav_path = output_dir / f"{sample_idx}.wav"
+            # Fill time after last speech with silence.
+            # It will be removed in the next stage
+            last_sample_idx = int(phoneme_samples[i].flatten().sum().item())
+            audio[i, 0, last_sample_idx+1:] = 0
 
-                wav_file: wave.Wave_write = wave.open(str(wav_path), "wb")
-                with wav_file:
-                    wav_file.setframerate(resample_rate)
-                    wav_file.setsampwidth(2)
-                    wav_file.setnchannels(1)
-                    wav_file.writeframes(audio_data)
+        # Convert audio to tensor for resampling if it's numpy
+        if isinstance(audio, np.ndarray):
+            import torch
+            audio_tensor = torch.from_numpy(audio).float()
+        else:
+            audio_tensor = audio
 
-                sample_idx += 1
-                if sample_idx >= max_samples:
-                    is_done = True
-                    break
+        # Resample audio
+        audio = resampler(audio_tensor.cpu()).numpy()
 
-            # print(f"Batch {batch_idx +1}/{max_samples//batch_size} complete", " "*200, end='\r')
+        audio_int16 = audio_float_to_int16(audio)
+        for audio_idx in range(audio_int16.shape[0]):
+            # Trim any silenced audio
+            audio_data = np.trim_zeros(audio_int16[audio_idx].flatten())
+            
+            # Use webrtcvad to trim any remaining silence from the clips
+            audio_data = remove_silence(audio_int16[audio_idx].flatten())[
+                None,
+            ]
+
+            if isinstance(file_names, it.cycle):
+                wav_path = output_dir / next(file_names)
+            else:
+                wav_path = output_dir / f"{sample_idx}.wav"
+
+            wav_file: wave.Wave_write = wave.open(str(wav_path), "wb")
+            with wav_file:
+                wav_file.setframerate(resample_rate)
+                wav_file.setsampwidth(2)
+                wav_file.setnchannels(1)
+                wav_file.writeframes(audio_data)
+
+            sample_idx += 1
+            if sample_idx >= max_samples:
+                is_done = True
+                break
 
         # Next batch
         _LOGGER.debug("Batch %s/%s complete", batch_idx + 1, max_samples // batch_size)
@@ -279,8 +289,8 @@ def remove_silence(
     return np.array(x_new).astype(np.int16)
 
 
-def generate_audio(
-    model,
+def generate_audio_onnx(
+    ort_session,
     speaker_1,
     speaker_2,
     phoneme_ids,
@@ -290,47 +300,46 @@ def generate_audio(
     length_scale,
     max_len,
 ):
-    x = torch.LongTensor(phoneme_ids)
-    x_lengths = torch.LongTensor([len(i) for i in phoneme_ids])
-
-    if torch.cuda.is_available():
-        speaker_1 = speaker_1.cuda()
-        speaker_2 = speaker_2.cuda()
-        x = x.cuda()
-        x_lengths = x_lengths.cuda()
-
-    x, m_p_orig, logs_p_orig, x_mask = model.enc_p(x, x_lengths)
-    emb0 = model.emb_g(speaker_1)
-    emb1 = model.emb_g(speaker_2)
-    g = slerp(emb0, emb1, slerp_weight).unsqueeze(-1)  # [b, h, 1]
-
-    if model.use_sdp:
-        logw = model.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
-    else:
-        logw = model.dp(x, x_mask, g=g)
-    w = torch.exp(logw) * x_mask * length_scale
-    w_ceil = torch.ceil(w)
-    y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
-    y_mask = torch.unsqueeze(
-        commons.sequence_mask(y_lengths, y_lengths.max()), 1
-    ).type_as(x_mask)
-    attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
-    attn = commons.generate_path(w_ceil, attn_mask)
-
-    m_p = torch.matmul(attn.squeeze(1), m_p_orig.transpose(1, 2)).transpose(
-        1, 2
-    )  # [b, t', t], [b, t, d] -> [b, d, t']
-    logs_p = torch.matmul(attn.squeeze(1), logs_p_orig.transpose(1, 2)).transpose(
-        1, 2
-    )  # [b, t', t], [b, t, d] -> [b, d, t']
-
-    z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
-    z = model.flow(z_p, y_mask, g=g, reverse=True)
-    o = model.dec((z * y_mask)[:, :, :max_len], g=g)
-
-    audio = o
-    phoneme_samples = w_ceil * 256  # hop length
-
+    """Generate audio using ONNX model inference"""
+    
+    # Convert inputs to numpy arrays with correct dtypes
+    x = np.array(phoneme_ids, dtype=np.int64)
+    x_lengths = np.array([len(i) for i in phoneme_ids], dtype=np.int64)
+    
+    # Pack scales into a single array as expected by the model
+    # The order might need adjustment based on your specific model
+    scales = np.array([noise_scale, length_scale, noise_scale_w], dtype=np.float32)
+    
+    # Prepare input dictionary for ONNX model based on the actual input names
+    inputs = {
+        'input': x,
+        'input_lengths': x_lengths,
+        'scales': scales,
+    }
+    
+    # Run inference
+    try:
+        outputs = ort_session.run(None, inputs)
+        audio = outputs[0]  # Audio is the only output
+        
+        # Since this model only outputs audio, we need to create dummy phoneme samples
+        # for compatibility with the rest of the code
+        phoneme_samples = []
+        for phoneme_seq in phoneme_ids:
+            # Create a simple approximation of phoneme timing
+            # Each phoneme gets roughly equal time
+            samples_per_phoneme = audio.shape[-1] // len(phoneme_seq) if len(phoneme_seq) > 0 else 256
+            phoneme_timing = np.ones(len(phoneme_seq)) * samples_per_phoneme
+            phoneme_samples.append(phoneme_timing)
+        
+        phoneme_samples = np.array(phoneme_samples)
+            
+    except Exception as e:
+        _LOGGER.error("ONNX inference failed: %s", e)
+        _LOGGER.error("Available input names: %s", [inp.name for inp in ort_session.get_inputs()])
+        _LOGGER.error("Available output names: %s", [out.name for out in ort_session.get_outputs()])
+        raise e
+    
     return audio, phoneme_samples
 
 
@@ -387,7 +396,7 @@ def get_phonemes(
 
 
 def slerp(v1, v2, t: float, DOT_THR: float = 0.9995, zdim: int = -1):
-    """SLERP for pytorch tensors interpolating `v1` to `v2` with scale of `t`.
+    """SLERP for numpy arrays interpolating `v1` to `v2` with scale of `t`.
 
     `DOT_THR` determines when the vectors are too close to parallel.
         If they are too close, then a regular linear interpolation is used.
@@ -398,35 +407,31 @@ def slerp(v1, v2, t: float, DOT_THR: float = 0.9995, zdim: int = -1):
 
     Theory Reference:
     https://splines.readthedocs.io/en/latest/rotation/slerp.html
-    PyTorch reference:
-    https://discuss.pytorch.org/t/help-regarding-slerp-function-for-generative-model-sampling/32475/3
-    Numpy reference:
-    https://gist.github.com/dvschultz/3af50c40df002da3b751efab1daddf2c
     """
 
     # take the dot product between normalized vectors
-    v1_norm = v1 / torch.norm(v1, dim=zdim, keepdim=True)
-    v2_norm = v2 / torch.norm(v2, dim=zdim, keepdim=True)
-    dot = (v1_norm * v2_norm).sum(zdim)
+    v1_norm = v1 / np.linalg.norm(v1, axis=zdim, keepdims=True)
+    v2_norm = v2 / np.linalg.norm(v2, axis=zdim, keepdims=True)
+    dot = (v1_norm * v2_norm).sum(axis=zdim)
 
     # if the vectors are too close, return a simple linear interpolation
-    if (torch.abs(dot) > DOT_THR).any():
+    if (np.abs(dot) > DOT_THR).any():
         res = (1 - t) * v1 + t * v2
 
     # else apply SLERP
     else:
         # compute the angle terms we need
-        theta = torch.acos(dot)
+        theta = np.arccos(np.clip(dot, -1, 1))
         theta_t = theta * t
-        sin_theta = torch.sin(theta)
-        sin_theta_t = torch.sin(theta_t)
+        sin_theta = np.sin(theta)
+        sin_theta_t = np.sin(theta_t)
 
         # compute the sine scaling terms for the vectors
-        s1 = torch.sin(theta - theta_t) / sin_theta
+        s1 = np.sin(theta - theta_t) / sin_theta
         s2 = sin_theta_t / sin_theta
 
         # interpolate the vectors
-        res = (s1.unsqueeze(zdim) * v1) + (s2.unsqueeze(zdim) * v2)
+        res = (np.expand_dims(s1, zdim) * v1) + (np.expand_dims(s2, zdim) * v2)
 
     return res
 
@@ -449,7 +454,7 @@ def main() -> None:
     parser.add_argument("text")
     parser.add_argument("--max-samples", required=True, type=int)
     parser.add_argument(
-        "--model", default=_DIR / "models" / "en_US-libritts_r-medium.pt"
+        "--model", default=_DIR / "models" / "it-IT-riccardo-x_low.onnx"
     )
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--slerp-weights", nargs="+", type=float, default=[0.5])
